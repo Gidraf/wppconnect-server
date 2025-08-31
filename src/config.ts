@@ -1,7 +1,7 @@
 import { ServerOptions } from './types/ServerOptions';
 
 export default {
-  secretKey: 'THISISMYSECURETOKEN',
+  secretKey: '14e866f74a6f260bfd89b76bca9f2bbb2a0a88a4',
   host: 'http://5.78.137.59',
   port: '21465',
   deviceName: 'cvpap',
