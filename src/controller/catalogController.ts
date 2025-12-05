@@ -44,11 +44,6 @@ export async function getProducts(req: Request, res: Response) {
     });
 
   try {
-    req.client?.getProducts(
-      phone as string,
-      qnt as unknown as number
-      
-    ).then(async (res) => {console.error("success * ",res);}).catch((e) => {console.error("error * ",e);});
     const result = await req.client?.getProducts(
       phone as string,
       qnt as unknown as number
