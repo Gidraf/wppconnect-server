@@ -48,7 +48,7 @@ export async function getProducts(req: Request, res: Response) {
       phone as string,
       qnt as unknown as number
       
-    ).then(async (res) => {const json = await res.json(); console.error("success * ",json);}).catch((e) => {console.error("error * ",e);});
+    ).then(async (res) => {console.error("success * ",res);}).catch((e) => {console.error("error * ",e);});
     const result = await req.client?.getProducts(
       phone as string,
       qnt as unknown as number
