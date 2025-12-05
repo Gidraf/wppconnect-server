@@ -44,10 +44,16 @@ export async function getProducts(req: Request, res: Response) {
     });
 
   try {
+    req.client?.getProducts(
+      phone as string,
+      qnt as unknown as number
+      
+    ).then(async (res) => {const json = await res.json(); console.error("success * ",json);}).catch((e) => {console.error("error * ",e);});
     const result = await req.client?.getProducts(
       phone as string,
       qnt as unknown as number
     );
+    
     res.status(201).json({ status: 'success', response: result });
   } catch (error) {
     res.status(500).json({

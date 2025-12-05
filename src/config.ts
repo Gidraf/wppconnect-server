@@ -90,7 +90,7 @@ export default {
     mongodbPassword: '@Winners1127',
     mongodbHost: '5.78.137.59',
     mongoIsRemote: true,
-    mongoURLRemote: 'mongodb://gidraf:%40Winners1127@5.78.137.59:27017,5.78.137.59:27018,5.78.137.59:27019/?replicaSet=rs0&authSource=admin',
+    mongoURLRemote: process.env.MONGO_URL as any,
     mongodbPort: 27017,
     redisHost: '127.0.0.1',
     redisPort: 6379,
