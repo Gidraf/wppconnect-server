@@ -7,6 +7,9 @@ export default {
   deviceName: 'cvpap',
   poweredBy: 'Ajiriwa',
   startAllSession: true,
+  session: {
+    autoClose: 0,
+  },
   tokenStoreType: 'mongodb',
   maxListeners: 15,
   customUserDataDir: './userDataDir/',
