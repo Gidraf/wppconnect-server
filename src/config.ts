@@ -7,7 +7,7 @@ export default {
   deviceName: 'cvpap',
   poweredBy: 'Ajiriwa',
   startAllSession: true,
-  tokenStoreType: 'file',
+  tokenStoreType: 'mongodb',
   maxListeners: 15,
   customUserDataDir: './userDataDir/',
   webhook: {
@@ -93,7 +93,7 @@ export default {
     mongodbCollection: 'whatsappBot',
     mongodbUser: 'gidraf',
     mongodbPassword: '@Winners1127',
-    mongodbHost: '5.78.137.59',
+    mongodbHost: process.env.MONGO_URL as any,
     mongoIsRemote: true,
     mongoURLRemote: process.env.MONGO_URL as any,
     mongodbPort: 27017,
