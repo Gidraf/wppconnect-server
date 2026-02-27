@@ -61,6 +61,7 @@ export default {
       '--disable-extensions',
       '--disable-sync',
       '--disable-dev-shm-usage',
+      '--disable-setuid-sandbox',
       '--disable-gpu',
       '--disable-translate',
       '--hide-scrollbars',
