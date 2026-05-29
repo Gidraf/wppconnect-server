@@ -72,7 +72,7 @@ export default {
     // 2. Set env:    BROWSERLESS_WS_ENDPOINT=ws://your-host:3000
     // 3. Uncomment:
     puppeteerOptions: {
-      browserWSEndpoint: 'https://browserless.gidraf.dev/',
+      browserWSEndpoint: 'https://browserless.gidraf.dev',
     },
     //
     // When using browserWSEndpoint, browserArgs below are IGNORED by Puppeteer

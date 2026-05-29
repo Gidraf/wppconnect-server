@@ -5,7 +5,7 @@
  * instead of mongodb / redis / file.
  */
 import config from '../../config';
-import ApiTokenStore from './apiTokenStore';
+import ApiTokenStore from './ApiTokenStore';
 import FileTokenStore from './fileTokenStory';
 import MongodbTokenStore from './mongodbTokenStory';
 import RedisTokenStore from './redisTokenStory';
