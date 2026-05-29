@@ -32,7 +32,7 @@ const SessionUtil = new CreateSessionUtil();
 async function downloadFileFunction(
   message: Message,
   client: Whatsapp,
-  logger: Logger
+  logger: Logger,
 ) {
   try {
     const buffer = await client.decryptFile(message);
@@ -59,7 +59,7 @@ async function downloadFileFunction(
   } catch (e) {
     logger.error(e);
     logger.warn(
-      'Erro ao descriptografar a midia, tentando fazer o download direto...'
+      'Erro ao descriptografar a midia, tentando fazer o download direto...',
     );
     try {
       const buffer = await client.downloadMedia(message);
@@ -100,7 +100,7 @@ export async function download(message: any, client: any, logger: any) {
 
 export async function startAllSessions(
   req: Request,
-  res: Response
+  res: Response,
 ): Promise<any> {
   /**
    * #swagger.tags = ["Auth"]
@@ -148,7 +148,7 @@ export async function startAllSessions(
 
 export async function showAllSessions(
   req: Request,
-  res: Response
+  res: Response,
 ): Promise<any> {
   /**
    * #swagger.tags = ["Auth"]
@@ -295,7 +295,7 @@ export async function logOutSession(req: Request, res: Response): Promise<any> {
    */
   try {
     const session = req.session;
-    await req.client.logout();
+    await req.client?.logout();
     deleteSessionOnArray(req.session);
 
     setTimeout(async () => {
@@ -342,7 +342,7 @@ export async function logOutSession(req: Request, res: Response): Promise<any> {
 
 export async function checkConnectionSession(
   req: Request,
-  res: Response
+  res: Response,
 ): Promise<any> {
   /**
    * #swagger.tags = ["Auth"]
@@ -546,7 +546,7 @@ export async function getQrCode(req: Request, res: Response) {
         : null;
       const img = Buffer.from(
         (qr as any).replace(/^data:image\/(png|jpeg|jpg);base64,/, ''),
-        'base64'
+        'base64',
       );
       res.writeHead(200, {
         'Content-Type': 'image/png',
