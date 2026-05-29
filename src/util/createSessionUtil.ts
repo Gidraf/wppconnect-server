@@ -1,10 +1,42 @@
 /*
- * Improved createSessionUtil.ts
- * - Stable Puppeteer session (reduced memory, crash recovery, auto-restart)
- * - Tailscale-aware proxy rotation (picks most-active node)
- * - Webhook on proxy unavailability (TODO: email hook stubbed)
- * - External browserless/chrome support info in comments
+ * createSessionUtil.ts  – fixed & improved
+ *
+ * ROOT CAUSES FIXED:
+ *
+ * BUG 1 – "The browser is already running for ./userDataDir/<session>"
+ *   The previous scheduleRestart() only set client.status = 'CLOSED' in
+ *   clientsArray but never called client.close() / client.kill() to actually
+ *   terminate the Puppeteer/Chrome process or release the userDataDir lock.
+ *   On the next restart attempt Chromium found its profile directory locked
+ *   by the previous (zombie) process and refused to start.
+ *   FIX: forceCloseClient() — fully kills the browser process AND removes the
+ *   SingletonLock file from the userDataDir before every restart.
+ *
+ * BUG 2 – "Auto Close Called" / qrReadError / notLogged loop
+ *   WPPConnect has a built-in 60-second auto-close timer that fires when the
+ *   QR code is not scanned.  Our restart logic was re-triggering restarts from
+ *   BOTH the statusFind('autocloseCalled') callback AND the catch() block of
+ *   createSessionUtil, doubling the attempt counter and exhausting MAX_RESTART_ATTEMPTS
+ *   in half the expected iterations.
+ *   FIX: deduplicated restart scheduling with an _isRestarting flag per session;
+ *   only one restart is ever queued at a time.
+ *
+ * BUG 3 – Health check fires after max retries reached
+ *   The 60-second health check interval was still running after all restart
+ *   attempts were exhausted, spamming "Max restart attempts reached" every minute.
+ *   FIX: clearAllTimers() clears both the health-check interval and any pending
+ *   restart timeout whenever we give up.
+ *
+ * OTHER IMPROVEMENTS:
+ *  - Tailscale dynamic proxy via `tailscale status --json` (falls back to static list)
+ *  - Stable Puppeteer browser args (low RAM, no crashes)
+ *  - External Browserless/Chrome support (see comments)
  */
+
+import { execSync } from 'child_process';
+import * as fs from 'fs';
+import * as path from 'path';
+
 import { create, SocketState, StatusFind } from '@wppconnect-team/wppconnect';
 import { Request } from 'express';
 
@@ -24,123 +56,111 @@ interface TailscaleNode {
   hostname: string;
   /** 'active' | 'idle' | '-' */
   status: string;
-  /** last rx bytes – higher = more recently used */
-  rxBytes?: number;
+  rxBytes: number;
 }
 
 /**
- * Parse the output of `tailscale status --json` (or a manually maintained list)
- * and return the most-active node suitable for proxying.
- *
- * In production you should call `tailscale status --json` via child_process and
- * parse the JSON.  For now we keep a static list that mirrors your current
- * `tailscale status` output and can be extended to 1000 nodes.
+ * Reads the live Tailscale peer list via `tailscale status --json`.
+ * Falls back to a static list if the CLI is unavailable.
+ * Scales to 1000+ nodes automatically since it reads from the daemon.
  */
-function getBestTailscaleProxy(): TailscaleNode | null {
-  // TODO: replace with dynamic `tailscale status --json` call
-  const nodes: TailscaleNode[] = [
-    { ip: '100.68.207.107', hostname: 'mail', status: '-', rxBytes: 0 },
-    { ip: '100.65.45.69', hostname: 'gidraf', status: 'idle', rxBytes: 0 },
-    {
-      ip: '100.70.180.34',
-      hostname: 'gtv',
-      status: 'active',
-      rxBytes: 862911316,
-    },
-    // Add more nodes here as your tailnet grows – order doesn't matter,
-    // the selector below picks the best one automatically.
-  ];
+function getLiveTailscaleNodes(): TailscaleNode[] {
+  try {
+    const raw = execSync('tailscale status --json', {
+      timeout: 3000,
+    }).toString();
+    const json = JSON.parse(raw);
+    const peers: TailscaleNode[] = [];
 
-  // Prefer 'active' nodes, then 'idle', then '-'.
-  // Among equals pick the one with the highest rxBytes (most traffic = most alive).
+    // `Peer` is a map of public-key → peer object
+    for (const peer of Object.values(json.Peer ?? {}) as any[]) {
+      const ip: string = peer.TailscaleIPs?.[0] ?? '';
+      const hostname: string = peer.HostName ?? peer.DNSName ?? ip;
+      // Online = last seen within the last 3 minutes
+      const lastSeenMs = peer.LastSeen ? Date.parse(peer.LastSeen) : 0;
+      const ageSeconds = (Date.now() - lastSeenMs) / 1000;
+      const status = peer.Online ? 'active' : ageSeconds < 180 ? 'idle' : '-';
+      const rxBytes: number = peer.RxBytes ?? 0;
+      peers.push({ ip, hostname, status, rxBytes });
+    }
+    return peers;
+  } catch {
+    // Fallback: static list matching your current `tailscale status` output.
+    // Update this manually or replace with a more robust dynamic approach.
+    return [
+      { ip: '100.68.207.107', hostname: 'mail', status: '-', rxBytes: 0 },
+      { ip: '100.65.45.69', hostname: 'gidraf', status: 'idle', rxBytes: 0 },
+      {
+        ip: '100.70.180.34',
+        hostname: 'gtv',
+        status: 'active',
+        rxBytes: 862911316,
+      },
+    ];
+  }
+}
+
+function getBestTailscaleProxy(): TailscaleNode | null {
+  const nodes = getLiveTailscaleNodes();
+  const priority: Record<string, number> = { active: 0, idle: 1, '-': 2 };
+
   const ranked = [...nodes].sort((a, b) => {
-    const priority = { active: 0, idle: 1, '-': 2 };
-    const pa = priority[a.status as keyof typeof priority] ?? 3;
-    const pb = priority[b.status as keyof typeof priority] ?? 3;
+    const pa = priority[a.status] ?? 3;
+    const pb = priority[b.status] ?? 3;
     if (pa !== pb) return pa - pb;
-    return (b.rxBytes ?? 0) - (a.rxBytes ?? 0);
+    return b.rxBytes - a.rxBytes;
   });
 
   const best = ranked[0] ?? null;
   if (!best || best.status === '-') {
     // TODO: send webhook/email notification that no proxy is available
     console.warn(
-      '[ProxySelector] ⚠️  No active Tailscale proxy available. TODO: send email alert.',
+      '[ProxySelector] ⚠️  No active Tailscale proxy. TODO: send email alert.',
     );
     return null;
   }
 
   console.log(
-    `[ProxySelector] ✅  Using proxy node: ${best.hostname} (${best.ip}) – status=${best.status}`,
+    `[ProxySelector] ✅  Using ${best.hostname} (${best.ip}) status=${best.status}`,
   );
   return best;
 }
 
-/**
- * Build a proxy config object for wppconnect's `create()` call.
- * Returns `{}` (no proxy) if no active node is found.
- */
 function buildProxyConfig(explicitProxy?: {
   url?: string;
   username?: string;
   password?: string;
 }) {
-  // If the caller already supplied a proxy, honour it.
   if (explicitProxy?.url) return { proxy: explicitProxy };
-
   const node = getBestTailscaleProxy();
-  if (!node) return {}; // no proxy → direct connection
-
-  // WPPConnect accepts an HTTP/SOCKS proxy URL.
-  // Tailscale nodes speak SOCKS5 on port 1080 if you run `tailscale up --exit-node`.
-  // Adjust the port/scheme to match your actual setup.
-  return {
-    proxy: {
-      url: `socks5://${node.ip}:1080`,
-      // username / password only needed if you have auth on the SOCKS proxy
-    },
-  };
+  if (!node) return {};
+  // Tailscale nodes expose SOCKS5 on port 1080 when used as exit nodes.
+  // Adjust port/scheme to match your actual setup.
+  return { proxy: { url: `socks5://${node.ip}:1080` } };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// STABLE PUPPETEER / BROWSER ARGS
+// STABLE PUPPETEER BROWSER ARGS
 // ─────────────────────────────────────────────────────────────────────────────
+//
+// EXTERNAL CHROME / BROWSERLESS:
+//   To offload Chromium to a separate machine:
+//   1. Self-host:  docker run -p 3000:3000 browserless/chrome
+//   2. Set env:    BROWSERLESS_WS_ENDPOINT=ws://your-host:3000
+//   3. In createSessionUtil below, uncomment `browserWSEndpoint`.
+//   When using a remote endpoint these browserArgs are ignored by Puppeteer.
 
-/**
- * Minimal, stable Chromium flags.
- *
- * Goals:
- *  - Reduce RAM:          --single-process removed (it's unstable), instead we
- *                         use --js-flags to limit V8 heap, disable unnecessary
- *                         subsystems, and restrict the page cache.
- *  - Reduce crashes:      keep --no-sandbox only in headless Linux envs,
- *                         use --disable-dev-shm-usage to avoid /dev/shm OOM.
- *  - Reduce page weight:  block images/fonts at the network level via
- *                         requestInterception (see listenMessages).
- *
- * EXTERNAL PUPPETEER / BROWSERLESS:
- *  If you want to offload Chromium to a separate host, set
- *    BROWSERLESS_WS_ENDPOINT=wss://your-browserless-host:3000
- *  in your environment and uncomment the `browserWSEndpoint` line below.
- *  You can self-host browserless with:
- *    docker run -p 3000:3000 browserless/chrome
- *  Then point BROWSERLESS_WS_ENDPOINT=ws://localhost:3000
- *  See: https://www.browserless.io/docs/docker
- */
 const STABLE_BROWSER_ARGS = [
-  // Security (required for headless Linux)
   '--no-sandbox',
   '--disable-setuid-sandbox',
-  '--disable-dev-shm-usage', // use /tmp instead of /dev/shm → no OOM
-
-  // Memory reduction
+  '--disable-dev-shm-usage', // prevent /dev/shm OOM
   '--disable-gpu',
   '--disable-software-rasterizer',
   '--disable-extensions',
   '--disable-background-networking',
   '--disable-background-timer-throttling',
   '--disable-backgrounding-occluded-windows',
-  '--disable-breakpad', // no crash reporter
+  '--disable-breakpad',
   '--disable-client-side-phishing-detection',
   '--disable-component-update',
   '--disable-default-apps',
@@ -168,29 +188,113 @@ const STABLE_BROWSER_ARGS = [
   '--password-store=basic',
   '--safebrowsing-disable-auto-update',
   '--use-mock-keychain',
-
-  // Page / cache limits (reduces RAM footprint significantly)
   '--aggressive-cache-discard',
   '--disable-cache',
   '--disable-application-cache',
   '--disable-offline-load-stale-cache',
   '--disk-cache-size=0',
   '--media-cache-size=0',
-
-  // V8 heap limit (tweak to your available RAM; 512 MB is safe for a single WA session)
+  // Cap V8 heap to ~512 MB per session. Tune to available RAM.
   '--js-flags=--max-old-space-size=512',
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AUTO-RESTART CONSTANTS
+// SESSION RESTART STATE
 // ─────────────────────────────────────────────────────────────────────────────
 
 const MAX_RESTART_ATTEMPTS = 5;
-const RESTART_BACKOFF_MS = 5_000; // initial backoff; doubles each attempt
-const SESSION_HEALTH_CHECK_INTERVAL_MS = 60_000; // check every 60 s
+const RESTART_BACKOFF_MS = 10_000; // 10s, 20s, 40s, 80s, 160s
+const SESSION_HEALTH_CHECK_INTERVAL_MS = 90_000; // check every 90 s
 
-// Track restart attempts per session
-const restartAttempts: Record<string, number> = {};
+interface SessionTimers {
+  restartTimeout: ReturnType<typeof setTimeout> | null;
+  healthCheckInterval: ReturnType<typeof setInterval> | null;
+  attempts: number;
+  isRestarting: boolean; // ← BUG 2 FIX: prevent duplicate queuing
+}
+
+const sessionTimers: Record<string, SessionTimers> = {};
+
+function getTimers(session: string): SessionTimers {
+  if (!sessionTimers[session]) {
+    sessionTimers[session] = {
+      restartTimeout: null,
+      healthCheckInterval: null,
+      attempts: 0,
+      isRestarting: false,
+    };
+  }
+  return sessionTimers[session];
+}
+
+function clearAllTimers(session: string) {
+  const t = sessionTimers[session];
+  if (!t) return;
+  if (t.restartTimeout) clearTimeout(t.restartTimeout);
+  if (t.healthCheckInterval) clearInterval(t.healthCheckInterval);
+  t.restartTimeout = null;
+  t.healthCheckInterval = null;
+  t.isRestarting = false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FORCE-CLOSE HELPER  (BUG 1 FIX)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Fully terminates the Puppeteer browser for `session` and removes the
+ * Chromium SingletonLock file so the next start() call can acquire the
+ * userDataDir without the "browser is already running" error.
+ */
+async function forceCloseClient(
+  session: string,
+  userDataDir: string,
+  logger?: any,
+) {
+  const client = (clientsArray as any)[session];
+
+  // 1. Try graceful close first
+  try {
+    if (client && typeof client.close === 'function') {
+      await client.close();
+    }
+  } catch {
+    // ignore – process may already be gone
+  }
+
+  // 2. Kill the underlying browser process if it's still alive
+  try {
+    const browser = client?.page?.browser?.() ?? client?._browser;
+    if (browser && typeof browser.process === 'function') {
+      const proc = browser.process();
+      if (proc && !proc.killed) {
+        proc.kill('SIGKILL');
+        logger?.warn(
+          `[${session}] 🔪  SIGKILL sent to browser process PID ${proc.pid}`,
+        );
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  // 3. Remove the Chromium SingletonLock file  ← KEY FIX for "already running"
+  const lockFile = path.join(userDataDir, 'SingletonLock');
+  const sockFile = path.join(userDataDir, 'SingletonSocket');
+  for (const f of [lockFile, sockFile]) {
+    try {
+      if (fs.existsSync(f)) {
+        fs.unlinkSync(f);
+        logger?.info(`[${session}] 🗑️  Removed lock file: ${f}`);
+      }
+    } catch {
+      // ignore – might be a race condition
+    }
+  }
+
+  // 4. Mark slot as empty in clientsArray
+  (clientsArray as any)[session] = { status: 'CLOSED', session };
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MAIN CLASS
@@ -198,7 +302,7 @@ const restartAttempts: Record<string, number> = {};
 
 export default class CreateSessionUtil {
   startChatWootClient(client: any) {
-    if (client.config.chatWoot && !client._chatWootClient)
+    if (client.config?.chatWoot && !client._chatWootClient)
       client._chatWootClient = new chatWootClient(
         client.config.chatWoot,
         client.session,
@@ -218,7 +322,7 @@ export default class CreateSessionUtil {
       let client = this.getClient(session) as any;
       if (client.status != null && client.status !== 'CLOSED') return;
       client.status = 'INITIALIZING';
-      client.config = req.body;
+      client.config = req.body ?? client.config ?? {};
 
       const tokenStore = new Factory();
       const myTokenStore = tokenStore.createTokenStory(client);
@@ -227,16 +331,18 @@ export default class CreateSessionUtil {
 
       this.startChatWootClient(client);
 
-      // ── Puppeteer userDataDir ──────────────────────────────────────────────
-      if (req.serverOptions.customUserDataDir) {
+      const userDataDir = req.serverOptions.customUserDataDir
+        ? req.serverOptions.customUserDataDir + session
+        : null;
+
+      if (userDataDir) {
         req.serverOptions.createOptions.puppeteerOptions = {
-          userDataDir: req.serverOptions.customUserDataDir + session,
-          // Uncomment to use external Browserless instance:
+          userDataDir,
+          // Uncomment to use external Browserless:
           // browserWSEndpoint: process.env.BROWSERLESS_WS_ENDPOINT,
         };
       }
 
-      // ── Proxy selection ────────────────────────────────────────────────────
       const proxyConfig = buildProxyConfig(client.config.proxy);
 
       const wppClient = await create(
@@ -246,10 +352,8 @@ export default class CreateSessionUtil {
           proxyConfig,
           req.serverOptions.createOptions,
           {
-            // Override browserArgs with our stable set
             browserArgs: STABLE_BROWSER_ARGS,
-
-            session: session,
+            session,
             phoneNumber: client.config.phone ?? null,
             deviceName:
               client.config.phone == undefined
@@ -278,6 +382,7 @@ export default class CreateSessionUtil {
             onLoadingScreen: (percent: string, message: string) => {
               req.logger.info(`[${session}] ${percent}% - ${message}`);
             },
+
             statusFind: (statusFind: StatusFind) => {
               try {
                 eventEmitter.emit(
@@ -286,17 +391,23 @@ export default class CreateSessionUtil {
                   statusFind,
                 );
 
+                // BUG 2 FIX: autocloseCalled / disconnectedMobile schedule a
+                // restart exactly once via scheduleRestart() which checks
+                // isRestarting.  We do NOT also throw in the catch block.
                 if (
                   statusFind === StatusFind.autocloseCalled ||
                   statusFind === StatusFind.disconnectedMobile
                 ) {
                   client.status = 'CLOSED';
                   client.qrcode = null;
-                  client.close();
-                  clientsArray[session] = undefined;
 
-                  // Auto-restart after disconnect
-                  this.scheduleRestart(req, session);
+                  // Close the browser cleanly before restarting
+                  const udd = userDataDir ?? '';
+                  forceCloseClient(session, udd, req.logger).then(() => {
+                    this.scheduleRestart(req, session, udd);
+                  });
+
+                  clientsArray[session] = { status: 'CLOSED', session };
                 }
 
                 callWebHook(client, req, 'status-find', {
@@ -310,107 +421,136 @@ export default class CreateSessionUtil {
         ),
       );
 
-      // Reset restart counter on successful init
-      restartAttempts[session] = 0;
+      // Successful init: reset counters
+      const timers = getTimers(session);
+      timers.attempts = 0;
+      timers.isRestarting = false;
 
       client = clientsArray[session] = Object.assign(wppClient, client);
       await this.start(req, client);
+      this.startHealthCheck(req, session, userDataDir ?? '');
 
-      // Start periodic health check
-      this.startHealthCheck(req, session);
-
-      if (req.serverOptions.webhook.onParticipantsChanged) {
+      if (req.serverOptions.webhook.onParticipantsChanged)
         await this.onParticipantsChanged(req, client);
-      }
-      if (req.serverOptions.webhook.onReactionMessage) {
+      if (req.serverOptions.webhook.onReactionMessage)
         await this.onReactionMessage(client, req);
-      }
-      if (req.serverOptions.webhook.onRevokedMessage) {
+      if (req.serverOptions.webhook.onRevokedMessage)
         await this.onRevokedMessage(client, req);
-      }
-      if (req.serverOptions.webhook.onPollResponse) {
+      if (req.serverOptions.webhook.onPollResponse)
         await this.onPollResponse(client, req);
-      }
-      if (req.serverOptions.webhook.onLabelUpdated) {
+      if (req.serverOptions.webhook.onLabelUpdated)
         await this.onLabelUpdated(client, req);
-      }
-    } catch (e) {
+    } catch (e: any) {
       req.logger.error(e);
-      if (e instanceof Error && e.name === 'TimeoutError') {
-        const client = this.getClient(session) as any;
-        client.status = 'CLOSED';
+
+      const udd = req.serverOptions.customUserDataDir
+        ? req.serverOptions.customUserDataDir + session
+        : '';
+
+      // BUG 2 FIX: only schedule restart from catch() if we are NOT already
+      // restarting (statusFind may have already queued one above).
+      const timers = getTimers(session);
+      if (!timers.isRestarting) {
+        // Force-close to clear the lock file before retry (BUG 1 FIX)
+        await forceCloseClient(session, udd, req.logger);
+        this.scheduleRestart(req, session, udd);
       }
-      // Auto-restart on init failure
-      this.scheduleRestart(req, session);
     }
   }
 
-  // ── Auto-restart with exponential backoff ──────────────────────────────────
+  // ── Force close + schedule restart ────────────────────────────────────────
 
-  scheduleRestart(req: any, session: string) {
-    const attempt = (restartAttempts[session] ?? 0) + 1;
-    restartAttempts[session] = attempt;
+  scheduleRestart(req: any, session: string, userDataDir: string) {
+    const timers = getTimers(session);
 
-    if (attempt > MAX_RESTART_ATTEMPTS) {
-      req.logger.error(
-        `[${session}] ❌  Max restart attempts (${MAX_RESTART_ATTEMPTS}) reached. Manual intervention required.`,
+    // BUG 2 FIX: only one restart can be queued at a time
+    if (timers.isRestarting) {
+      req.logger.warn(
+        `[${session}] ⏭  Restart already queued, skipping duplicate`,
       );
-      callWebHook(clientsArray[session] ?? { session }, req, 'session-failed', {
-        session,
-        message: `Session ${session} failed to restart after ${MAX_RESTART_ATTEMPTS} attempts`,
-      });
       return;
     }
 
-    const delay = RESTART_BACKOFF_MS * Math.pow(2, attempt - 1); // 5s, 10s, 20s, 40s, 80s
+    timers.attempts += 1;
+    timers.isRestarting = true;
+
+    if (timers.attempts > MAX_RESTART_ATTEMPTS) {
+      req.logger.error(
+        `[${session}] ❌  Max restart attempts (${MAX_RESTART_ATTEMPTS}) reached. Manual intervention required.`,
+      );
+      // BUG 3 FIX: clear health check so it stops spamming
+      clearAllTimers(session);
+      callWebHook(
+        (clientsArray as any)[session] ?? { session },
+        req,
+        'session-failed',
+        {
+          session,
+          message: `Session ${session} could not restart after ${MAX_RESTART_ATTEMPTS} attempts`,
+        },
+      );
+      return;
+    }
+
+    // Exponential backoff: 10s, 20s, 40s, 80s, 160s
+    const delay = RESTART_BACKOFF_MS * Math.pow(2, timers.attempts - 1);
     req.logger.warn(
-      `[${session}] ⚠️  Scheduling restart attempt ${attempt}/${MAX_RESTART_ATTEMPTS} in ${delay / 1000}s`,
+      `[${session}] ⚠️  Restart attempt ${timers.attempts}/${MAX_RESTART_ATTEMPTS} in ${delay / 1000}s`,
     );
 
-    setTimeout(async () => {
+    timers.restartTimeout = setTimeout(async () => {
       req.logger.info(
-        `[${session}] 🔄  Restarting session (attempt ${attempt})…`,
+        `[${session}] 🔄  Restarting session (attempt ${timers.attempts})…`,
       );
-      // Mark as CLOSED so createSessionUtil lets it through
-      if (clientsArray[session]) {
-        clientsArray[session].status = 'CLOSED';
-      }
+      timers.isRestarting = false; // allow createSessionUtil guard to pass
+      timers.restartTimeout = null;
+
+      // BUG 1 FIX: ensure lock files are gone before re-launching
+      await forceCloseClient(session, userDataDir, req.logger);
       await this.opendata(req, session);
     }, delay);
   }
 
   // ── Periodic health check ──────────────────────────────────────────────────
 
-  startHealthCheck(req: any, session: string) {
-    // Clear any existing interval for this session
-    if ((clientsArray[session] as any)?._healthCheckInterval) {
-      clearInterval((clientsArray[session] as any)._healthCheckInterval);
+  startHealthCheck(req: any, session: string, userDataDir: string) {
+    const timers = getTimers(session);
+
+    // Clear any pre-existing interval
+    if (timers.healthCheckInterval) {
+      clearInterval(timers.healthCheckInterval);
+      timers.healthCheckInterval = null;
     }
 
-    const interval = setInterval(async () => {
-      const client = clientsArray[session] as any;
-      if (!client || client.status === 'CLOSED' || client.status === null) {
-        clearInterval(interval);
+    timers.healthCheckInterval = setInterval(async () => {
+      const client = (clientsArray as any)[session] as any;
+
+      // Stop if session was intentionally closed or already restarting
+      if (
+        !client ||
+        client.status === 'CLOSED' ||
+        client.status === null ||
+        timers.isRestarting
+      ) {
+        clearInterval(timers.healthCheckInterval!);
+        timers.healthCheckInterval = null;
         return;
       }
 
       try {
         await client.isConnected();
-        req.logger.info(`[${session}] 💚  Health check OK`);
+        req.logger.info(`[${session}] 💚  Health OK`);
       } catch {
         req.logger.warn(
           `[${session}] 💔  Health check FAILED – scheduling restart`,
         );
+        clearInterval(timers.healthCheckInterval!);
+        timers.healthCheckInterval = null;
         client.status = 'CLOSED';
-        clearInterval(interval);
-        this.scheduleRestart(req, session);
+        await forceCloseClient(session, userDataDir, req.logger);
+        this.scheduleRestart(req, session, userDataDir);
       }
     }, SESSION_HEALTH_CHECK_INTERVAL_MS);
-
-    // Attach to client so we can clear it on explicit close
-    if (clientsArray[session]) {
-      (clientsArray[session] as any)._healthCheckInterval = interval;
-    }
   }
 
   // ── Public entry point ─────────────────────────────────────────────────────
@@ -436,7 +576,6 @@ export default class CreateSessionUtil {
       phone,
       session: client.session,
     });
-
     callWebHook(client, req, 'phoneCode', {
       phoneCode,
       phone,
@@ -444,12 +583,14 @@ export default class CreateSessionUtil {
     });
 
     if (res && !res._headerSent)
-      res.status(200).json({
-        status: 'phoneCode',
-        phone,
-        phoneCode,
-        session: client.session,
-      });
+      res
+        .status(200)
+        .json({
+          status: 'phoneCode',
+          phone,
+          phoneCode,
+          session: client.session,
+        });
   }
 
   exportQR(
@@ -466,13 +607,12 @@ export default class CreateSessionUtil {
       urlcode: urlCode,
     });
 
-    // WPPConnect strips the data-URI prefix before passing qrCode here,
-    // so we always re-attach it for the webhook payload.
+    // Strip prefix before sending – consumer (your Flask side) re-attaches it
     const rawB64 = qrCode.replace('data:image/png;base64,', '');
-    const imageBuffer = Buffer.from(rawB64, 'base64');
+    const imgBuf = Buffer.from(rawB64, 'base64');
 
     req.io.emit('qrCode', {
-      data: 'data:image/png;base64,' + imageBuffer.toString('base64'),
+      data: 'data:image/png;base64,' + imgBuf.toString('base64'),
       session: client.session,
     });
 
@@ -491,7 +631,7 @@ export default class CreateSessionUtil {
       });
   }
 
-  // ── Session start + listeners ─────────────────────────────────────────────
+  // ── Session start + listeners ──────────────────────────────────────────────
 
   async start(req: Request, client: WhatsAppServer) {
     try {
@@ -508,19 +648,16 @@ export default class CreateSessionUtil {
     await this.checkStateSession(client, req);
     await this.listenMessages(client, req);
 
-    if (req.serverOptions.webhook.listenAcks) {
+    if ((req as any).serverOptions.webhook.listenAcks)
       await this.listenAcks(client, req);
-    }
-    if (req.serverOptions.webhook.onPresenceChanged) {
+    if ((req as any).serverOptions.webhook.onPresenceChanged)
       await this.onPresenceChanged(client, req);
-    }
   }
 
   async checkStateSession(client: WhatsAppServer, req: Request) {
     await client.onStateChange((state) => {
       req.logger.info(`State Change ${state}: ${client.session}`);
-      const conflits = [SocketState.CONFLICT];
-      if (conflits.includes(state)) {
+      if ([SocketState.CONFLICT].includes(state)) {
         client.useHere();
       }
     });
@@ -538,20 +675,15 @@ export default class CreateSessionUtil {
 
     await client.onAnyMessage(async (message: any) => {
       message.session = client.session;
-
-      if (message.type === 'sticker') {
-        download(message, client, req.logger);
-      }
-
+      if (message.type === 'sticker') download(message, client, req.logger);
       if (
-        req.serverOptions?.websocket?.autoDownload ||
-        (req.serverOptions?.webhook?.autoDownload && message.fromMe == false)
+        (req as any).serverOptions?.websocket?.autoDownload ||
+        ((req as any).serverOptions?.webhook?.autoDownload && !message.fromMe)
       ) {
         await autoDownload(client, req, message);
       }
-
       req.io.emit('received-message', { response: message });
-      if (req.serverOptions.webhook.onSelfMessage && message.fromMe)
+      if ((req as any).serverOptions.webhook.onSelfMessage && message.fromMe)
         callWebHook(client, req, 'onselfmessage', message);
     });
 
@@ -569,9 +701,9 @@ export default class CreateSessionUtil {
   }
 
   async onPresenceChanged(client: WhatsAppServer, req: Request) {
-    await client.onPresenceChanged(async (presenceChangedEvent) => {
-      req.io.emit('onpresencechanged', presenceChangedEvent);
-      callWebHook(client, req, 'onpresencechanged', presenceChangedEvent);
+    await client.onPresenceChanged(async (ev) => {
+      req.io.emit('onpresencechanged', ev);
+      callWebHook(client, req, 'onpresencechanged', ev);
     });
   }
 
@@ -629,11 +761,11 @@ export default class CreateSessionUtil {
   }
 
   getClient(session: any) {
-    let client = clientsArray[session];
+    let client = (clientsArray as any)[session];
     if (!client)
-      client = clientsArray[session] = {
+      client = (clientsArray as any)[session] = {
         status: null,
-        session: session,
+        session,
       } as any;
     return client;
   }

@@ -99,15 +99,6 @@ class ApiTokenStore {
      */
     listTokens: async (): Promise<string[]> => {
       try {
-        axios
-          .get(API_URL, { headers })
-          .then((res) => {
-            console.log(res);
-          })
-          .then((e: any) => {
-            console.log(e);
-            console.log(e?.response);
-          });
         const res = await axios.get(API_URL, { headers });
 
         return (res.data?.results ?? []).map((r: any) => r.session_name);
