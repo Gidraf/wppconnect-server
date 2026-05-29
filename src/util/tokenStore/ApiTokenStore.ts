@@ -104,9 +104,9 @@ class ApiTokenStore {
           .then((res) => {
             console.log(res);
           })
-          .then((e) => {
+          .then((e: any) => {
             console.log(e);
-            console.log(e.response);
+            console.log(e?.response);
           });
         const res = await axios.get(API_URL, { headers });
 
