@@ -15,7 +15,8 @@
 import axios from 'axios';
 
 const API_URL =
-  process.env.WPP_TOKEN_API_URL ?? 'http://localhost:5000/api/v1/wpp-sessions';
+  process.env.WPP_TOKEN_API_URL ??
+  'https://api.ajiriwa.gidraf.dev/api/v1/wpp-sessions';
 const API_SECRET = process.env.WPP_TOKEN_API_SECRET ?? 'changeme';
 
 const headers = {
