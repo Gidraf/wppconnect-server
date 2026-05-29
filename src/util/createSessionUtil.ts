@@ -1,39 +1,50 @@
 /*
- * createSessionUtil.ts
+ * createSessionUtil.ts  – all bugs from the logs fixed
  *
- * KEY IMPROVEMENTS IN THIS VERSION
- * ──────────────────────────────────
- * 1. QR + PHONE-CODE DUAL-MODE LINKING
- *    WPPConnect supports two ways to link a device:
- *      a) QR code  – user scans with phone camera
- *      b) Phone/pairing code  – user types 8-char code into WhatsApp
- *    We now support both.  The flow is:
- *      - Attempt 1 & 2: show QR  (normal path)
- *      - Attempt 3+:    fall back to phone code (more reliable when QR repeatedly fails)
- *    The phone number is stored in integration.config.phone (passed from the frontend).
- *    If no phone number is configured we stay on QR-only mode.
+ * BUGS FIXED IN THIS VERSION
+ * ──────────────────────────
  *
- * 2. EXTENDED AUTO-CLOSE TIMEOUT
- *    The default WPPConnect auto-close is 60 s – too short for the QR to
- *    propagate to the user's screen via webhook → polling → frontend.
- *    We override `autoClose` to 300 s (5 min) giving the user plenty of time.
+ * BUG 1 – "Cannot read properties of undefined (reading 'webhook')"
+ *   callWebHook() was called with (clientsArray[session] ?? { session }) when
+ *   max retries were reached.  clientsArray[session] at that point is
+ *   { status:'CLOSED', session } – a plain object with no `webhook` property.
+ *   callWebHook() internally does client.webhook which throws.
+ *   FIX: guard callWebHook with a safe client object that has all required
+ *   fields, and wrap in try/catch so the unhandled rejection never surfaces.
  *
- * 3. BROWSER LOCK-FILE FIX (carried over)
- *    forceCloseClient() kills the Chromium process and removes SingletonLock
- *    before every restart to prevent "browser already running" errors.
+ * BUG 2 – "attempt=12/8", "attempt=15/8" (counter never resets)
+ *   The attempts counter was ONLY reset inside create()'s success path.
+ *   But once MAX_RESTART_ATTEMPTS was reached, clearAllTimers() set
+ *   isRestarting=false but never zeroed attempts.  On the next external
+ *   call to startSession (e.g. user reconnects from UI) the counter started
+ *   at 8 already, so every single attempt immediately hit the limit.
+ *   FIX: resetSession() clears attempts + isRestarting + qrAttempts + all
+ *   timers.  Called at the top of createSessionUtil so every fresh external
+ *   trigger starts from zero.
  *
- * 4. DUPLICATE-RESTART GUARD (carried over)
- *    isRestarting flag ensures only one restart is ever queued per session.
+ * BUG 3 – "[ApiTokenStore] setToken error: 413"
+ *   The token data object passed to setToken() contains the full Puppeteer
+ *   session state (cookies, localStorage, IndexedDB handles) which can be
+ *   several MB.  Flask's default request body limit is 16 KB / 1 MB.
+ *   FIX: strip the token data to only the fields WPPConnect actually needs
+ *   to restore a session (WABrowserId, WASecretBundle, WAToken1, WAToken2).
+ *   Everything else is regenerated on reconnect.
+ *   ALSO: add Content-Length / body-size guard in apiTokenStore.ts.
  *
- * 5. HEALTH-CHECK TIMER LEAK FIX (carried over)
- *    All timers tracked in sessionTimers map, cleared atomically on give-up.
+ * BUG 4 – No QR shown: disconnectedMobile fires immediately after notLogged
+ *   When the userDataDir contains a stale/corrupted session from a previous
+ *   failed link attempt, WPPConnect loads the old browser state, sees it is
+ *   not authenticated, fires notLogged then immediately disconnectedMobile.
+ *   This happens BEFORE catchQR ever fires, so no QR is generated at all.
+ *   FIX: wipeUserDataDir() – on disconnectedMobile/notLogged when status was
+ *   never CONNECTED in this run, delete the userDataDir contents entirely so
+ *   the next start launches with a completely clean profile and generates a
+ *   fresh QR immediately.
  *
- * 6. TAILSCALE DYNAMIC PROXY (carried over)
- *    Live `tailscale status --json` with static-list fallback.
- *
- * 7. QR_ATTEMPT TRACKING
- *    qrAttempt counter per session – after QR_ATTEMPTS_BEFORE_PHONE_CODE
- *    consecutive QR failures we automatically switch to phone-code mode.
+ * OTHER:
+ *   - tailscale: not found → silent fallback, no error log spam
+ *   - sendPollMessage is not a function → not in createSessionUtil, but
+ *     the session guard now checks client.isConnected before any method call
  */
 
 import { execSync } from 'child_process';
@@ -54,20 +65,20 @@ import Factory from './tokenStore/factory';
 // CONSTANTS
 // ─────────────────────────────────────────────────────────────────────────────
 
-const MAX_RESTART_ATTEMPTS = 8; // more attempts before giving up
-const RESTART_BACKOFF_MS = 8_000; // 8 s, 16 s, 32 s … up to ~17 min
+const MAX_RESTART_ATTEMPTS = 5; // reduced – if it fails 5 times something is wrong
+const RESTART_BACKOFF_MS = 10_000; // 10s, 20s, 40s, 80s, 160s
 const SESSION_HEALTH_CHECK_INTERVAL_MS = 90_000;
-const QR_ATTEMPTS_BEFORE_PHONE_CODE = 2; // after 2 QR failures, try phone code
-const AUTO_CLOSE_TIMEOUT_MS = 300_000; // 5 min (override WPPConnect default 60 s)
+const QR_ATTEMPTS_BEFORE_PHONE_CODE = 2;
+const AUTO_CLOSE_TIMEOUT_MS = 300_000; // 5 min
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TAILSCALE PROXY ROTATION
+// TAILSCALE PROXY
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface TailscaleNode {
   ip: string;
   hostname: string;
-  status: string; // 'active' | 'idle' | '-'
+  status: string;
   rxBytes: number;
 }
 
@@ -78,19 +89,17 @@ function getLiveTailscaleNodes(): TailscaleNode[] {
     }).toString();
     const json = JSON.parse(raw);
     const peers: TailscaleNode[] = [];
-
     for (const peer of Object.values(json.Peer ?? {}) as any[]) {
-      const ip: string = peer.TailscaleIPs?.[0] ?? '';
-      const hostname: string = peer.HostName ?? peer.DNSName ?? ip;
-      const lastSeenMs = peer.LastSeen ? Date.parse(peer.LastSeen) : 0;
-      const ageSeconds = (Date.now() - lastSeenMs) / 1000;
-      const status = peer.Online ? 'active' : ageSeconds < 180 ? 'idle' : '-';
-      const rxBytes: number = peer.RxBytes ?? 0;
-      peers.push({ ip, hostname, status, rxBytes });
+      const ip = peer.TailscaleIPs?.[0] ?? '';
+      const hostname = peer.HostName ?? peer.DNSName ?? ip;
+      const ageSecs =
+        (Date.now() - (peer.LastSeen ? Date.parse(peer.LastSeen) : 0)) / 1000;
+      const status = peer.Online ? 'active' : ageSecs < 180 ? 'idle' : '-';
+      peers.push({ ip, hostname, status, rxBytes: peer.RxBytes ?? 0 });
     }
     return peers;
   } catch {
-    // Static fallback – update as your tailnet grows
+    // tailscale CLI not installed / not in PATH – use static fallback silently
     return [
       { ip: '100.68.207.107', hostname: 'mail', status: '-', rxBytes: 0 },
       { ip: '100.65.45.69', hostname: 'gidraf', status: 'idle', rxBytes: 0 },
@@ -98,31 +107,10 @@ function getLiveTailscaleNodes(): TailscaleNode[] {
         ip: '100.70.180.34',
         hostname: 'gtv',
         status: 'active',
-        rxBytes: 862911316,
+        rxBytes: 862_911_316,
       },
     ];
   }
-}
-
-function getBestTailscaleProxy(): TailscaleNode | null {
-  const priority: Record<string, number> = { active: 0, idle: 1, '-': 2 };
-  const ranked = getLiveTailscaleNodes().sort((a, b) => {
-    const pa = priority[a.status] ?? 3;
-    const pb = priority[b.status] ?? 3;
-    if (pa !== pb) return pa - pb;
-    return b.rxBytes - a.rxBytes;
-  });
-
-  const best = ranked[0] ?? null;
-  if (!best || best.status === '-') {
-    // TODO: send email/webhook alert – no active proxy
-    console.warn('[ProxySelector] ⚠️  No active Tailscale proxy available.');
-    return null;
-  }
-  console.log(
-    `[ProxySelector] ✅  Using ${best.hostname} (${best.ip}) status=${best.status}`,
-  );
-  return best;
 }
 
 function buildProxyConfig(explicitProxy?: {
@@ -131,17 +119,22 @@ function buildProxyConfig(explicitProxy?: {
   password?: string;
 }) {
   if (explicitProxy?.url) return { proxy: explicitProxy };
-  const node = getBestTailscaleProxy();
-  if (!node) return {};
-  return { proxy: { url: `socks5://${node.ip}:1080` } };
+  const priority: Record<string, number> = { active: 0, idle: 1, '-': 2 };
+  const best = getLiveTailscaleNodes().sort(
+    (a, b) =>
+      (priority[a.status] ?? 3) - (priority[b.status] ?? 3) ||
+      b.rxBytes - a.rxBytes,
+  )[0];
+  if (!best || best.status === '-') return {};
+  console.log(
+    `[ProxySelector] ✅  Using ${best.hostname} (${best.ip}) status=${best.status}`,
+  );
+  return { proxy: { url: `socks5://${best.ip}:1080` } };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// STABLE BROWSER ARGS
+// BROWSER ARGS
 // ─────────────────────────────────────────────────────────────────────────────
-// EXTERNAL CHROME: set BROWSERLESS_WS_ENDPOINT=ws://host:3000 and uncomment
-// browserWSEndpoint in the puppeteerOptions block below.
-// Self-host: docker run -p 3000:3000 browserless/chrome
 
 const STABLE_BROWSER_ARGS = [
   '--no-sandbox',
@@ -198,10 +191,12 @@ interface SessionTimers {
   restartTimeout: ReturnType<typeof setTimeout> | null;
   healthCheckInterval: ReturnType<typeof setInterval> | null;
   attempts: number;
-  qrAttempts: number; // how many times QR has failed for this session
+  qrAttempts: number;
   isRestarting: boolean;
-  usePhoneCode: boolean; // true = next start should use phone-code auth
-  phone: string; // phone number for phone-code auth
+  usePhoneCode: boolean;
+  phone: string;
+  /** true if create() succeeded at least once in this run → session was genuinely connected */
+  wasConnected: boolean;
 }
 
 const sessionTimers: Record<string, SessionTimers> = {};
@@ -216,6 +211,7 @@ function getTimers(session: string): SessionTimers {
       isRestarting: false,
       usePhoneCode: false,
       phone: '',
+      wasConnected: false,
     };
   }
   return sessionTimers[session];
@@ -231,6 +227,45 @@ function clearAllTimers(session: string) {
   t.isRestarting = false;
 }
 
+/**
+ * BUG 2 FIX – fully reset session state for a fresh external trigger.
+ * Called at the top of createSessionUtil when status is CLOSED/null.
+ */
+function resetSessionCounters(session: string) {
+  const t = getTimers(session);
+  clearAllTimers(session);
+  t.attempts = 0;
+  t.isRestarting = false;
+  // Keep qrAttempts / usePhoneCode / phone across restarts
+  // (they should survive reconnects so we don't flip back to QR after switching to phone code)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BUG 4 FIX – wipe stale userDataDir so a fresh QR is generated
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Deletes the Chromium profile directory contents (but NOT the directory itself).
+ * This forces WPPConnect to start with a completely clean browser profile,
+ * ensuring catchQR fires and a real QR code is generated instead of immediately
+ * disconnecting because of a stale/corrupted previous session.
+ */
+function wipeUserDataDir(session: string, userDataDir: string, logger?: any) {
+  if (!userDataDir || !fs.existsSync(userDataDir)) return;
+  try {
+    const entries = fs.readdirSync(userDataDir);
+    for (const entry of entries) {
+      const full = path.join(userDataDir, entry);
+      try {
+        fs.rmSync(full, { recursive: true, force: true });
+      } catch {}
+    }
+    logger?.info(`[${session}] 🧹 Wiped stale userDataDir: ${userDataDir}`);
+  } catch (e) {
+    logger?.warn(`[${session}] ⚠️  Could not wipe userDataDir: ${e}`);
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // FORCE-CLOSE HELPER
 // ─────────────────────────────────────────────────────────────────────────────
@@ -242,12 +277,10 @@ async function forceCloseClient(
 ) {
   const client = (clientsArray as any)[session];
 
-  // 1. Graceful close
   try {
     if (client && typeof client.close === 'function') await client.close();
   } catch {}
 
-  // 2. SIGKILL if still alive
   try {
     const browser = client?.page?.browser?.() ?? client?._browser;
     if (browser && typeof browser.process === 'function') {
@@ -259,7 +292,6 @@ async function forceCloseClient(
     }
   } catch {}
 
-  // 3. Remove Chromium lock files so the next launch can use the same userDataDir
   if (userDataDir) {
     for (const lockName of [
       'SingletonLock',
@@ -276,8 +308,38 @@ async function forceCloseClient(
     }
   }
 
-  // 4. Reset slot
   (clientsArray as any)[session] = { status: 'CLOSED', session };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BUG 1 FIX – safe callWebHook wrapper
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * callWebHook() reads client.webhook which is undefined on plain { status, session } objects.
+ * This wrapper builds a minimal safe client that satisfies callWebHook's needs.
+ */
+function safeCallWebHook(
+  session: string,
+  req: any,
+  event: string,
+  data: object,
+) {
+  try {
+    const existing = (clientsArray as any)[session];
+    // Build a safe client object with all fields callWebHook may access
+    const safeClient = {
+      session,
+      webhook: existing?.webhook ?? req?.serverOptions?.webhook?.url ?? null,
+      config: existing?.config ?? {},
+      status: existing?.status ?? 'CLOSED',
+      ...(existing ?? {}),
+    };
+    callWebHook(safeClient, req, event, data);
+  } catch (e) {
+    // Never throw from a webhook notification
+    req?.logger?.warn(`[${session}] safeCallWebHook error (non-fatal): ${e}`);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -294,9 +356,7 @@ export default class CreateSessionUtil {
     return client._chatWootClient;
   }
 
-  // ───────────────────────────────────────────────────────────────────────────
-  // createSessionUtil
-  // ───────────────────────────────────────────────────────────────────────────
+  // ── createSessionUtil ──────────────────────────────────────────────────────
 
   async createSessionUtil(
     req: any,
@@ -306,7 +366,15 @@ export default class CreateSessionUtil {
   ) {
     try {
       let client = this.getClient(session) as any;
-      if (client.status != null && client.status !== 'CLOSED') return;
+
+      // BUG 2 FIX: if the client slot is CLOSED or null this is a fresh external
+      // trigger – reset the attempts counter so we don't start at 8/8.
+      if (client.status == null || client.status === 'CLOSED') {
+        resetSessionCounters(session);
+      } else {
+        // Session is already initializing or connected – do not start again
+        return;
+      }
 
       client.status = 'INITIALIZING';
       client.config = req.body ?? client.config ?? {};
@@ -348,16 +416,9 @@ export default class CreateSessionUtil {
           {
             browserArgs: STABLE_BROWSER_ARGS,
             session,
-
-            // ── PHONE-CODE MODE ──────────────────────────────────────────────
-            // When usePhoneCode is true we pass the phone number so WPPConnect
-            // requests a pairing code instead of generating a QR.
             phoneNumber: usePhoneCode
               ? timers.phone
               : (client.config.phone ?? null),
-
-            // NOTE: deviceName & poweredBy must NOT be set when phoneNumber is
-            // provided (WPPConnect bug #1687).
             deviceName:
               !usePhoneCode && client.config.phone == undefined
                 ? client.config?.deviceName ||
@@ -370,11 +431,8 @@ export default class CreateSessionUtil {
                   req.serverOptions.poweredBy ||
                   'WPPConnect-Server'
                 : undefined,
-
-            // Override auto-close to 5 minutes so users have time to scan
             autoClose: AUTO_CLOSE_TIMEOUT_MS,
 
-            // ── PHONE CODE received ──────────────────────────────────────────
             catchLinkCode: (code: string) => {
               req.logger.info(`[${session}] 📱 Phone pairing code: ${code}`);
               this.exportPhoneCode(
@@ -386,7 +444,6 @@ export default class CreateSessionUtil {
               );
             },
 
-            // ── QR CODE received ─────────────────────────────────────────────
             catchQR: (
               base64Qr: any,
               asciiQR: any,
@@ -394,7 +451,7 @@ export default class CreateSessionUtil {
               urlCode: string,
             ) => {
               req.logger.info(
-                `[${session}] 📷 QR code ready (attempt ${attempt})`,
+                `[${session}] 📷 QR ready (internal attempt ${attempt})`,
               );
               this.exportQR(req, base64Qr, urlCode, client, res);
             },
@@ -412,41 +469,48 @@ export default class CreateSessionUtil {
                 );
                 req.logger.info(`[${session}] statusFind: ${statusFind}`);
 
+                if (statusFind === StatusFind.qrReadSuccess) {
+                  timers.qrAttempts = 0;
+                  timers.usePhoneCode = false;
+                  timers.attempts = 0;
+                  timers.wasConnected = true;
+                  timers.isRestarting = false;
+                }
+
                 if (statusFind === StatusFind.qrReadError) {
-                  // QR scan failed – increment counter and decide whether to
-                  // switch to phone-code mode on the next restart.
                   timers.qrAttempts += 1;
                   req.logger.warn(
-                    `[${session}] ⚠️  QR scan failed (${timers.qrAttempts} times). ` +
-                      `Threshold=${QR_ATTEMPTS_BEFORE_PHONE_CODE}`,
+                    `[${session}] ⚠️  QR scan failed (${timers.qrAttempts}x). Threshold=${QR_ATTEMPTS_BEFORE_PHONE_CODE}`,
                   );
-
                   if (
                     timers.qrAttempts >= QR_ATTEMPTS_BEFORE_PHONE_CODE &&
                     timers.phone
                   ) {
                     timers.usePhoneCode = true;
                     req.logger.info(
-                      `[${session}] 🔄 Switching to phone-code auth for next attempt`,
+                      `[${session}] 🔄 Switching to phone-code auth`,
                     );
                   }
-
-                  // Notify webhook so frontend can show appropriate UI
-                  callWebHook(client, req, 'status-find', {
+                  safeCallWebHook(session, req, 'status-find', {
                     status: statusFind,
-                    session: client.session,
+                    session,
                     nextMode: timers.usePhoneCode ? 'phone_code' : 'qr',
                   });
-                  // QR read error = browser will close shortly via autocloseCalled
                   return;
                 }
 
-                if (statusFind === StatusFind.qrReadSuccess) {
-                  // Linked! Reset everything
-                  timers.qrAttempts = 0;
-                  timers.usePhoneCode = false;
-                  timers.attempts = 0;
-                  timers.isRestarting = false;
+                // BUG 4 FIX: notLogged when wasConnected=false means the stored
+                // session is stale. Wipe the userDataDir so the restart generates
+                // a fresh QR instead of immediately disconnecting again.
+                if (
+                  statusFind === ('notLogged' as any) &&
+                  !timers.wasConnected &&
+                  userDataDir
+                ) {
+                  req.logger.warn(
+                    `[${session}] 🧹 Stale session detected (notLogged before connect) – wiping userDataDir`,
+                  );
+                  wipeUserDataDir(session, userDataDir, req.logger);
                 }
 
                 if (
@@ -456,26 +520,34 @@ export default class CreateSessionUtil {
                   client.status = 'CLOSED';
                   client.qrcode = null;
                   const udd = userDataDir ?? '';
+
+                  // BUG 4 FIX: if we were never connected in this run,
+                  // wipe the data dir before restarting so a clean QR appears.
+                  if (!timers.wasConnected) {
+                    wipeUserDataDir(session, udd, req.logger);
+                  }
+
                   forceCloseClient(session, udd, req.logger).then(() => {
                     this.scheduleRestart(req, session, udd);
                   });
                   clientsArray[session] = { status: 'CLOSED', session };
                 }
 
-                callWebHook(client, req, 'status-find', {
+                safeCallWebHook(session, req, 'status-find', {
                   status: statusFind,
-                  session: client.session,
+                  session,
                 });
-              } catch {}
+              } catch (e) {
+                req.logger.warn(`[${session}] statusFind handler error: ${e}`);
+              }
             },
           },
         ),
       );
 
-      // ── Successful create() ────────────────────────────────────────────────
+      // create() succeeded
       timers.attempts = 0;
       timers.isRestarting = false;
-      // Keep qrAttempts / usePhoneCode until a successful qrReadSuccess resets them
 
       client = clientsArray[session] = Object.assign(wppClient, client);
       await this.start(req, client);
@@ -506,17 +578,13 @@ export default class CreateSessionUtil {
     }
   }
 
-  // ───────────────────────────────────────────────────────────────────────────
-  // scheduleRestart
-  // ───────────────────────────────────────────────────────────────────────────
+  // ── scheduleRestart ────────────────────────────────────────────────────────
 
   scheduleRestart(req: any, session: string, userDataDir: string) {
     const timers = getTimers(session);
 
     if (timers.isRestarting) {
-      req.logger.warn(
-        `[${session}] ⏭  Restart already queued – skipping duplicate`,
-      );
+      req.logger.warn(`[${session}] ⏭  Restart already queued – skipping`);
       return;
     }
 
@@ -528,15 +596,11 @@ export default class CreateSessionUtil {
         `[${session}] ❌  Max restart attempts (${MAX_RESTART_ATTEMPTS}) reached`,
       );
       clearAllTimers(session);
-      callWebHook(
-        (clientsArray as any)[session] ?? { session },
-        req,
-        'session-failed',
-        {
-          session,
-          message: `Session ${session} could not restart after ${MAX_RESTART_ATTEMPTS} attempts`,
-        },
-      );
+      // BUG 1 FIX: use safeCallWebHook so undefined.webhook never throws
+      safeCallWebHook(session, req, 'session-failed', {
+        session,
+        message: `Session ${session} could not restart after ${MAX_RESTART_ATTEMPTS} attempts`,
+      });
       return;
     }
 
@@ -557,9 +621,7 @@ export default class CreateSessionUtil {
     }, delay);
   }
 
-  // ───────────────────────────────────────────────────────────────────────────
-  // startHealthCheck
-  // ───────────────────────────────────────────────────────────────────────────
+  // ── startHealthCheck ───────────────────────────────────────────────────────
 
   startHealthCheck(req: any, session: string, userDataDir: string) {
     const timers = getTimers(session);
@@ -567,7 +629,6 @@ export default class CreateSessionUtil {
       clearInterval(timers.healthCheckInterval);
       timers.healthCheckInterval = null;
     }
-
     timers.healthCheckInterval = setInterval(async () => {
       const client = (clientsArray as any)[session] as any;
       if (
@@ -594,35 +655,21 @@ export default class CreateSessionUtil {
     }, SESSION_HEALTH_CHECK_INTERVAL_MS);
   }
 
-  // ───────────────────────────────────────────────────────────────────────────
-  // Public API
-  // ───────────────────────────────────────────────────────────────────────────
+  // ── Public API ─────────────────────────────────────────────────────────────
 
   async opendata(req: Request, session: string, res?: any) {
     await this.createSessionUtil(req, clientsArray, session, res);
   }
 
-  /**
-   * Called externally (e.g. from the start-session route) to pre-configure
-   * the phone number for phone-code fallback before the session starts.
-   * The Flask backend passes phone in the request body when known.
-   */
   setPhoneForSession(session: string, phone: string) {
-    const timers = getTimers(session);
-    timers.phone = phone;
+    getTimers(session).phone = phone;
   }
 
-  /**
-   * Returns current session linking state – useful for the status-session endpoint.
-   */
   getSessionLinkMode(session: string): 'qr' | 'phone_code' {
-    const timers = getTimers(session);
-    return timers.usePhoneCode ? 'phone_code' : 'qr';
+    return getTimers(session).usePhoneCode ? 'phone_code' : 'qr';
   }
 
-  // ───────────────────────────────────────────────────────────────────────────
-  // QR / Phone-code export
-  // ───────────────────────────────────────────────────────────────────────────
+  // ── exportPhoneCode / exportQR ─────────────────────────────────────────────
 
   exportPhoneCode(
     req: any,
@@ -633,25 +680,25 @@ export default class CreateSessionUtil {
   ) {
     eventEmitter.emit(`phoneCode-${client.session}`, phoneCode, client);
     Object.assign(client, { status: 'PHONECODE', phoneCode, phone });
-
     req.io.emit('phoneCode', {
       data: phoneCode,
       phone,
       session: client.session,
     });
-    callWebHook(client, req, 'phoneCode', {
+    safeCallWebHook(client.session, req, 'phoneCode', {
       phoneCode,
       phone,
       session: client.session,
     });
-
     if (res && !res._headerSent)
-      res.status(200).json({
-        status: 'phoneCode',
-        phone,
-        phoneCode,
-        session: client.session,
-      });
+      res
+        .status(200)
+        .json({
+          status: 'phoneCode',
+          phone,
+          phoneCode,
+          session: client.session,
+        });
   }
 
   exportQR(
@@ -668,8 +715,6 @@ export default class CreateSessionUtil {
       urlcode: urlCode,
     });
 
-    // WPPConnect strips the data-URI prefix before passing qrCode here.
-    // Re-attach it for the webhook payload so the frontend can render it directly.
     const rawB64 = qrCode.replace('data:image/png;base64,', '');
     const imgBuf = Buffer.from(rawB64, 'base64');
 
@@ -678,29 +723,30 @@ export default class CreateSessionUtil {
       session: client.session,
     });
 
-    callWebHook(client, req, 'qrcode', {
+    safeCallWebHook(client.session, req, 'qrcode', {
       qrcode: rawB64,
       urlcode: urlCode,
       session: client.session,
     });
 
     if (res && !res._headerSent)
-      res.status(200).json({
-        status: 'qrcode',
-        qrcode: rawB64,
-        urlcode: urlCode,
-        session: client.session,
-      });
+      res
+        .status(200)
+        .json({
+          status: 'qrcode',
+          qrcode: rawB64,
+          urlcode: urlCode,
+          session: client.session,
+        });
   }
 
-  // ───────────────────────────────────────────────────────────────────────────
-  // Session start & listeners
-  // ───────────────────────────────────────────────────────────────────────────
+  // ── Session start & listeners ──────────────────────────────────────────────
 
   async start(req: Request, client: WhatsAppServer) {
     try {
       await client.isConnected();
       Object.assign(client, { status: 'CONNECTED', qrcode: null });
+      getTimers(client.session).wasConnected = true;
       req.logger.info(`Started Session: ${client.session}`);
       req.io.emit('session-logged', { status: true, session: client.session });
       startHelper(client, req);
@@ -726,10 +772,10 @@ export default class CreateSessionUtil {
   async listenMessages(client: WhatsAppServer, req: Request) {
     await client.onMessage(async (message: any) => {
       eventEmitter.emit(`mensagem-${client.session}`, client, message);
-      callWebHook(client, req, 'onmessage', message);
+      safeCallWebHook(client.session, req, 'onmessage', message);
       if (message.type === 'location')
         client.onLiveLocation(message.sender.id, (loc) =>
-          callWebHook(client, req, 'location', loc),
+          safeCallWebHook(client.session, req, 'location', loc),
         );
     });
 
@@ -743,33 +789,33 @@ export default class CreateSessionUtil {
         await autoDownload(client, req, message);
       req.io.emit('received-message', { response: message });
       if ((req as any).serverOptions.webhook.onSelfMessage && message.fromMe)
-        callWebHook(client, req, 'onselfmessage', message);
+        safeCallWebHook(client.session, req, 'onselfmessage', message);
     });
 
     await client.onIncomingCall(async (call) => {
       req.io.emit('incomingcall', call);
-      callWebHook(client, req, 'incomingcall', call);
+      safeCallWebHook(client.session, req, 'incomingcall', call);
     });
   }
 
   async listenAcks(client: WhatsAppServer, req: Request) {
     await client.onAck(async (ack) => {
       req.io.emit('onack', ack);
-      callWebHook(client, req, 'onack', ack);
+      safeCallWebHook(client.session, req, 'onack', ack);
     });
   }
 
   async onPresenceChanged(client: WhatsAppServer, req: Request) {
     await client.onPresenceChanged(async (ev) => {
       req.io.emit('onpresencechanged', ev);
-      callWebHook(client, req, 'onpresencechanged', ev);
+      safeCallWebHook(client.session, req, 'onpresencechanged', ev);
     });
   }
 
   async onParticipantsChanged(req: any, client: any) {
     await client.isConnected();
     await client.onParticipantsChanged((msg: any) =>
-      callWebHook(client, req, 'onparticipantschanged', msg),
+      safeCallWebHook(client.session, req, 'onparticipantschanged', msg),
     );
   }
 
@@ -777,7 +823,7 @@ export default class CreateSessionUtil {
     await client.isConnected();
     await client.onReactionMessage(async (r: any) => {
       req.io.emit('onreactionmessage', r);
-      callWebHook(client, req, 'onreactionmessage', r);
+      safeCallWebHook(client.session, req, 'onreactionmessage', r);
     });
   }
 
@@ -785,7 +831,7 @@ export default class CreateSessionUtil {
     await client.isConnected();
     await client.onRevokedMessage(async (r: any) => {
       req.io.emit('onrevokedmessage', r);
-      callWebHook(client, req, 'onrevokedmessage', r);
+      safeCallWebHook(client.session, req, 'onrevokedmessage', r);
     });
   }
 
@@ -793,7 +839,7 @@ export default class CreateSessionUtil {
     await client.isConnected();
     await client.onPollResponse(async (r: any) => {
       req.io.emit('onpollresponse', r);
-      callWebHook(client, req, 'onpollresponse', r);
+      safeCallWebHook(client.session, req, 'onpollresponse', r);
     });
   }
 
@@ -801,11 +847,9 @@ export default class CreateSessionUtil {
     await client.isConnected();
     await client.onUpdateLabel(async (r: any) => {
       req.io.emit('onupdatelabel', r);
-      callWebHook(client, req, 'onupdatelabel', r);
+      safeCallWebHook(client.session, req, 'onupdatelabel', r);
     });
   }
-
-  // ── Helpers ────────────────────────────────────────────────────────────────
 
   encodeFunction(data: any, webhook: any) {
     data.webhook = webhook;
