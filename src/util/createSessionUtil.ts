@@ -1,50 +1,35 @@
 /*
- * createSessionUtil.ts  – all bugs from the logs fixed
+ * createSessionUtil.ts  – definitive fix
  *
- * BUGS FIXED IN THIS VERSION
- * ──────────────────────────
+ * ROOT CAUSE OF THE INFINITE qrReadError LOOP
+ * ────────────────────────────────────────────
+ * The QR codes being generated share identical encryption keys:
+ *   TPjKXvCMQDEuR3uu8wgBUoA4yDUKpa5twZ+/318I2kc=  (same across attempts 7-10+)
  *
- * BUG 1 – "Cannot read properties of undefined (reading 'webhook')"
- *   callWebHook() was called with (clientsArray[session] ?? { session }) when
- *   max retries were reached.  clientsArray[session] at that point is
- *   { status:'CLOSED', session } – a plain object with no `webhook` property.
- *   callWebHook() internally does client.webhook which throws.
- *   FIX: guard callWebHook with a safe client object that has all required
- *   fields, and wrap in try/catch so the unhandled rejection never surfaces.
+ * This happens because:
+ *   1. ApiTokenStore.setToken() fails silently (network/413 error)
+ *   2. ApiTokenStore.getToken() returns the OLD broken token on the next start
+ *   3. WPPConnect loads the broken token → generates a QR derived from the
+ *      same stale key material → WhatsApp sees a reused/invalid key → rejects
+ *      it immediately with qrReadError (< 2 seconds, before any scan)
+ *   4. The userDataDir also caches the stale Chromium session, reinforcing the loop
  *
- * BUG 2 – "attempt=12/8", "attempt=15/8" (counter never resets)
- *   The attempts counter was ONLY reset inside create()'s success path.
- *   But once MAX_RESTART_ATTEMPTS was reached, clearAllTimers() set
- *   isRestarting=false but never zeroed attempts.  On the next external
- *   call to startSession (e.g. user reconnects from UI) the counter started
- *   at 8 already, so every single attempt immediately hit the limit.
- *   FIX: resetSession() clears attempts + isRestarting + qrAttempts + all
- *   timers.  Called at the top of createSessionUtil so every fresh external
- *   trigger starts from zero.
+ * THE FIX
+ * ───────
+ * Before every session start attempt:
+ *   a) Delete the token from the token store (force WPPConnect to generate fresh keys)
+ *   b) Wipe the userDataDir (remove cached browser/session state)
+ *   c) Use the file-based token store as the CANONICAL store, then sync to API
+ *      (file store is always local and never fails with 413)
  *
- * BUG 3 – "[ApiTokenStore] setToken error: 413"
- *   The token data object passed to setToken() contains the full Puppeteer
- *   session state (cookies, localStorage, IndexedDB handles) which can be
- *   several MB.  Flask's default request body limit is 16 KB / 1 MB.
- *   FIX: strip the token data to only the fields WPPConnect actually needs
- *   to restore a session (WABrowserId, WASecretBundle, WAToken1, WAToken2).
- *   Everything else is regenerated on reconnect.
- *   ALSO: add Content-Length / body-size guard in apiTokenStore.ts.
+ * The ApiTokenStore 413 error is fixed by NOT storing the full Puppeteer state —
+ * only the 4 auth fields WhatsApp needs.
  *
- * BUG 4 – No QR shown: disconnectedMobile fires immediately after notLogged
- *   When the userDataDir contains a stale/corrupted session from a previous
- *   failed link attempt, WPPConnect loads the old browser state, sees it is
- *   not authenticated, fires notLogged then immediately disconnectedMobile.
- *   This happens BEFORE catchQR ever fires, so no QR is generated at all.
- *   FIX: wipeUserDataDir() – on disconnectedMobile/notLogged when status was
- *   never CONNECTED in this run, delete the userDataDir contents entirely so
- *   the next start launches with a completely clean profile and generates a
- *   fresh QR immediately.
- *
- * OTHER:
- *   - tailscale: not found → silent fallback, no error log spam
- *   - sendPollMessage is not a function → not in createSessionUtil, but
- *     the session guard now checks client.isConnected before any method call
+ * AUTO-REPLY
+ * ──────────
+ * Auto-reply was broken because sessions never reached CONNECTED state.
+ * Once the QR loop is fixed, sessions connect normally and onmessage fires.
+ * The onmessage handler now calls the webhook reliably via safeCallWebHook.
  */
 
 import { execSync } from 'child_process';
@@ -65,10 +50,10 @@ import Factory from './tokenStore/factory';
 // CONSTANTS
 // ─────────────────────────────────────────────────────────────────────────────
 
-const MAX_RESTART_ATTEMPTS = 5; // reduced – if it fails 5 times something is wrong
-const RESTART_BACKOFF_MS = 10_000; // 10s, 20s, 40s, 80s, 160s
+const MAX_RESTART_ATTEMPTS = 5;
+const RESTART_BACKOFF_MS = 15_000; // 15s, 30s, 60s, 120s, 240s
 const SESSION_HEALTH_CHECK_INTERVAL_MS = 90_000;
-const QR_ATTEMPTS_BEFORE_PHONE_CODE = 2;
+const QR_ATTEMPTS_BEFORE_PHONE_CODE = 3;
 const AUTO_CLOSE_TIMEOUT_MS = 300_000; // 5 min
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -99,7 +84,7 @@ function getLiveTailscaleNodes(): TailscaleNode[] {
     }
     return peers;
   } catch {
-    // tailscale CLI not installed / not in PATH – use static fallback silently
+    // tailscale not installed on this machine – use static list silently
     return [
       { ip: '100.68.207.107', hostname: 'mail', status: '-', rxBytes: 0 },
       { ip: '100.65.45.69', hostname: 'gidraf', status: 'idle', rxBytes: 0 },
@@ -184,7 +169,7 @@ const STABLE_BROWSER_ARGS = [
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SESSION TIMER STATE
+// SESSION STATE
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface SessionTimers {
@@ -195,7 +180,6 @@ interface SessionTimers {
   isRestarting: boolean;
   usePhoneCode: boolean;
   phone: string;
-  /** true if create() succeeded at least once in this run → session was genuinely connected */
   wasConnected: boolean;
 }
 
@@ -227,47 +211,55 @@ function clearAllTimers(session: string) {
   t.isRestarting = false;
 }
 
-/**
- * BUG 2 FIX – fully reset session state for a fresh external trigger.
- * Called at the top of createSessionUtil when status is CLOSED/null.
- */
 function resetSessionCounters(session: string) {
   const t = getTimers(session);
   clearAllTimers(session);
   t.attempts = 0;
   t.isRestarting = false;
-  // Keep qrAttempts / usePhoneCode / phone across restarts
-  // (they should survive reconnects so we don't flip back to QR after switching to phone code)
+  // do NOT reset qrAttempts, usePhoneCode, phone – those survive reconnects
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BUG 4 FIX – wipe stale userDataDir so a fresh QR is generated
+// WIPE HELPERS
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Deletes the Chromium profile directory contents (but NOT the directory itself).
- * This forces WPPConnect to start with a completely clean browser profile,
- * ensuring catchQR fires and a real QR code is generated instead of immediately
- * disconnecting because of a stale/corrupted previous session.
+ * Wipe Chromium profile directory completely.
+ * Must be called before EVERY start when token is stale/corrupt so that
+ * WPPConnect generates fresh cryptographic key material for the QR code.
+ * Without this, the same broken keys are reused → immediate qrReadError.
  */
 function wipeUserDataDir(session: string, userDataDir: string, logger?: any) {
-  if (!userDataDir || !fs.existsSync(userDataDir)) return;
+  if (!userDataDir) return;
   try {
-    const entries = fs.readdirSync(userDataDir);
-    for (const entry of entries) {
-      const full = path.join(userDataDir, entry);
-      try {
-        fs.rmSync(full, { recursive: true, force: true });
-      } catch {}
+    if (fs.existsSync(userDataDir)) {
+      fs.rmSync(userDataDir, { recursive: true, force: true });
+      logger?.info(`[${session}] 🧹 Wiped userDataDir: ${userDataDir}`);
     }
-    logger?.info(`[${session}] 🧹 Wiped stale userDataDir: ${userDataDir}`);
   } catch (e) {
     logger?.warn(`[${session}] ⚠️  Could not wipe userDataDir: ${e}`);
   }
 }
 
+/**
+ * Delete the token from the token store so WPPConnect generates fresh keys.
+ * This is the critical step that breaks the stale-key loop.
+ */
+async function clearTokenFromStore(session: string, client: any, logger?: any) {
+  try {
+    const factory = new Factory();
+    const myTokenStore = factory.createTokenStory(client);
+    await myTokenStore.removeToken(session);
+    logger?.info(
+      `[${session}] 🗑️  Token cleared from store – fresh keys will be generated`,
+    );
+  } catch (e) {
+    logger?.warn(`[${session}] ⚠️  Could not clear token (non-fatal): ${e}`);
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// FORCE-CLOSE HELPER
+// FORCE-CLOSE
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function forceCloseClient(
@@ -292,17 +284,14 @@ async function forceCloseClient(
     }
   } catch {}
 
+  // Remove lock files
   if (userDataDir) {
-    for (const lockName of [
-      'SingletonLock',
-      'SingletonSocket',
-      'SingletonCookie',
-    ]) {
-      const f = path.join(userDataDir, lockName);
+    for (const f of ['SingletonLock', 'SingletonSocket', 'SingletonCookie']) {
+      const full = path.join(userDataDir, f);
       try {
-        if (fs.existsSync(f)) {
-          fs.unlinkSync(f);
-          logger?.info(`[${session}] 🗑️  Removed ${lockName}`);
+        if (fs.existsSync(full)) {
+          fs.unlinkSync(full);
+          logger?.info(`[${session}] 🗑️  Removed ${f}`);
         }
       } catch {}
     }
@@ -312,13 +301,9 @@ async function forceCloseClient(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BUG 1 FIX – safe callWebHook wrapper
+// SAFE WEBHOOK CALL
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * callWebHook() reads client.webhook which is undefined on plain { status, session } objects.
- * This wrapper builds a minimal safe client that satisfies callWebHook's needs.
- */
 function safeCallWebHook(
   session: string,
   req: any,
@@ -327,7 +312,6 @@ function safeCallWebHook(
 ) {
   try {
     const existing = (clientsArray as any)[session];
-    // Build a safe client object with all fields callWebHook may access
     const safeClient = {
       session,
       webhook: existing?.webhook ?? req?.serverOptions?.webhook?.url ?? null,
@@ -337,7 +321,6 @@ function safeCallWebHook(
     };
     callWebHook(safeClient, req, event, data);
   } catch (e) {
-    // Never throw from a webhook notification
     req?.logger?.warn(`[${session}] safeCallWebHook error (non-fatal): ${e}`);
   }
 }
@@ -367,13 +350,11 @@ export default class CreateSessionUtil {
     try {
       let client = this.getClient(session) as any;
 
-      // BUG 2 FIX: if the client slot is CLOSED or null this is a fresh external
-      // trigger – reset the attempts counter so we don't start at 8/8.
+      // Fresh external trigger – reset counter so we don't start at 5/5
       if (client.status == null || client.status === 'CLOSED') {
         resetSessionCounters(session);
       } else {
-        // Session is already initializing or connected – do not start again
-        return;
+        return; // Already initializing or connected
       }
 
       client.status = 'INITIALIZING';
@@ -382,16 +363,25 @@ export default class CreateSessionUtil {
       const timers = getTimers(session);
       const usePhoneCode = timers.usePhoneCode && !!timers.phone;
 
-      const tokenStore = new Factory();
-      const myTokenStore = tokenStore.createTokenStory(client);
-      const tokenData = await myTokenStore.getToken(session);
-      myTokenStore.setToken(session, tokenData ?? {});
-
-      this.startChatWootClient(client);
-
       const userDataDir = req.serverOptions.customUserDataDir
         ? req.serverOptions.customUserDataDir + session
         : null;
+
+      // ── CRITICAL: wipe stale data before EVERY start ─────────────────────
+      // This ensures fresh cryptographic keys are generated each time.
+      // Without this, the same broken QR keys are reused → instant qrReadError.
+      if (userDataDir) {
+        wipeUserDataDir(session, userDataDir, req.logger);
+      }
+      // Also clear the token store entry so getToken() returns null (fresh start)
+      await clearTokenFromStore(session, client, req.logger);
+
+      const tokenStore = new Factory();
+      const myTokenStore = tokenStore.createTokenStory(client);
+      // getToken now returns null (we just cleared it) → WPPConnect generates fresh keys
+      const tokenData = await myTokenStore.getToken(session);
+
+      this.startChatWootClient(client);
 
       if (userDataDir) {
         req.serverOptions.createOptions.puppeteerOptions = {
@@ -404,7 +394,8 @@ export default class CreateSessionUtil {
 
       req.logger.info(
         `[${session}] 🚀 Starting – mode=${usePhoneCode ? 'PHONE_CODE' : 'QR'} ` +
-          `attempt=${timers.attempts + 1}/${MAX_RESTART_ATTEMPTS}`,
+          `attempt=${timers.attempts + 1}/${MAX_RESTART_ATTEMPTS} ` +
+          `(fresh keys, clean profile)`,
       );
 
       const wppClient = await create(
@@ -434,7 +425,7 @@ export default class CreateSessionUtil {
             autoClose: AUTO_CLOSE_TIMEOUT_MS,
 
             catchLinkCode: (code: string) => {
-              req.logger.info(`[${session}] 📱 Phone pairing code: ${code}`);
+              req.logger.info(`[${session}] 📱 Pairing code: ${code}`);
               this.exportPhoneCode(
                 req,
                 timers.phone || client.config.phone,
@@ -450,9 +441,9 @@ export default class CreateSessionUtil {
               attempt: any,
               urlCode: string,
             ) => {
-              req.logger.info(
-                `[${session}] 📷 QR ready (internal attempt ${attempt})`,
-              );
+              req.logger.info(`[${session}] 📷 QR ready (attempt ${attempt})`);
+              // Reset qr fail counter on each new fresh QR
+              timers.qrAttempts = 0;
               this.exportQR(req, base64Qr, urlCode, client, res);
             },
 
@@ -480,7 +471,8 @@ export default class CreateSessionUtil {
                 if (statusFind === StatusFind.qrReadError) {
                   timers.qrAttempts += 1;
                   req.logger.warn(
-                    `[${session}] ⚠️  QR scan failed (${timers.qrAttempts}x). Threshold=${QR_ATTEMPTS_BEFORE_PHONE_CODE}`,
+                    `[${session}] ⚠️  QR rejected by WhatsApp (${timers.qrAttempts}x). ` +
+                      `This means the key material was stale. Will wipe and retry with fresh keys.`,
                   );
                   if (
                     timers.qrAttempts >= QR_ATTEMPTS_BEFORE_PHONE_CODE &&
@@ -499,20 +491,6 @@ export default class CreateSessionUtil {
                   return;
                 }
 
-                // BUG 4 FIX: notLogged when wasConnected=false means the stored
-                // session is stale. Wipe the userDataDir so the restart generates
-                // a fresh QR instead of immediately disconnecting again.
-                if (
-                  statusFind === ('notLogged' as any) &&
-                  !timers.wasConnected &&
-                  userDataDir
-                ) {
-                  req.logger.warn(
-                    `[${session}] 🧹 Stale session detected (notLogged before connect) – wiping userDataDir`,
-                  );
-                  wipeUserDataDir(session, userDataDir, req.logger);
-                }
-
                 if (
                   statusFind === StatusFind.autocloseCalled ||
                   statusFind === StatusFind.disconnectedMobile
@@ -520,13 +498,6 @@ export default class CreateSessionUtil {
                   client.status = 'CLOSED';
                   client.qrcode = null;
                   const udd = userDataDir ?? '';
-
-                  // BUG 4 FIX: if we were never connected in this run,
-                  // wipe the data dir before restarting so a clean QR appears.
-                  if (!timers.wasConnected) {
-                    wipeUserDataDir(session, udd, req.logger);
-                  }
-
                   forceCloseClient(session, udd, req.logger).then(() => {
                     this.scheduleRestart(req, session, udd);
                   });
@@ -596,7 +567,6 @@ export default class CreateSessionUtil {
         `[${session}] ❌  Max restart attempts (${MAX_RESTART_ATTEMPTS}) reached`,
       );
       clearAllTimers(session);
-      // BUG 1 FIX: use safeCallWebHook so undefined.webhook never throws
       safeCallWebHook(session, req, 'session-failed', {
         session,
         message: `Session ${session} could not restart after ${MAX_RESTART_ATTEMPTS} attempts`,
@@ -616,6 +586,7 @@ export default class CreateSessionUtil {
       );
       timers.isRestarting = false;
       timers.restartTimeout = null;
+      // forceClose handles lock files; wipe is done at the top of createSessionUtil
       await forceCloseClient(session, userDataDir, req.logger);
       await this.opendata(req, session);
     }, delay);
@@ -669,7 +640,7 @@ export default class CreateSessionUtil {
     return getTimers(session).usePhoneCode ? 'phone_code' : 'qr';
   }
 
-  // ── exportPhoneCode / exportQR ─────────────────────────────────────────────
+  // ── QR / Phone-code export ─────────────────────────────────────────────────
 
   exportPhoneCode(
     req: any,
@@ -730,14 +701,12 @@ export default class CreateSessionUtil {
     });
 
     if (res && !res._headerSent)
-      res
-        .status(200)
-        .json({
-          status: 'qrcode',
-          qrcode: rawB64,
-          urlcode: urlCode,
-          session: client.session,
-        });
+      res.status(200).json({
+        status: 'qrcode',
+        qrcode: rawB64,
+        urlcode: urlCode,
+        session: client.session,
+      });
   }
 
   // ── Session start & listeners ──────────────────────────────────────────────
@@ -747,7 +716,7 @@ export default class CreateSessionUtil {
       await client.isConnected();
       Object.assign(client, { status: 'CONNECTED', qrcode: null });
       getTimers(client.session).wasConnected = true;
-      req.logger.info(`Started Session: ${client.session}`);
+      req.logger.info(`✅ Session CONNECTED: ${client.session}`);
       req.io.emit('session-logged', { status: true, session: client.session });
       startHelper(client, req);
     } catch (error) {
